@@ -2,14 +2,32 @@
 <#
 Author: Lee Burridge (patched by Copilot)
 Date: January 16, 2026
-Description: Analyze Windows event logs (last 24h) and log issues with suggested solutions.
+Description: Analyze Windows event logs (last 10 days) and log issues with suggested solutions.
 Adds DMEDP/WUfB error-code extraction (hex & decimal) + common code hints.
 Patched to match solutions by Channel (LogName) OR Source (ProviderName),
 with a heuristic that maps Windows Update Client events logged in System
 to the Operational channel mappings.
 #>
 
-$logPath = Join-Path -Path "$env:ProgramData\Microsoft\IntuneManagementExtension\Logs" -ChildPath "EventLogAnalysis.log"
+$logDir  = Join-Path -Path "$env:ProgramData\Microsoft\IntuneManagementExtension\Logs" -ChildPath "."
+$logPath = Join-Path -Path $logDir -ChildPath "EventLogAnalysis.log"
+
+# Ensure log directory exists
+if (-not (Test-Path -LiteralPath $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+}
+
+# ---------------------------
+# OVERWRITE LOG ON EACH RUN
+# ---------------------------
+$header = @(
+    "Event Log Analysis Report"
+    "Run on: $(Get-Date)"
+    "------------------------"
+) -join [Environment]::NewLine
+
+# Set-Content overwrites by default (fresh file each run)
+Set-Content -Path $logPath -Value $header -Encoding utf8
 
 # --- Helper: case-insensitive hashtable ---
 function New-CaseInsensitiveHashtable {
@@ -130,19 +148,16 @@ function Get-ErrorCodesFromEvent {
     $codes = New-Object System.Collections.Generic.List[string]
     $rx = '(?i)0x[0-9a-f]{6,8}|-?2147\d{6}'  # hex HRESULTs and negative decimal HRESULTs
 
-    # From properties (structured) first
     foreach ($prop in $Event.Properties) {
         $val = [string]$prop.Value
         if ([string]::IsNullOrWhiteSpace($val)) { continue }
         foreach ($m in [regex]::Matches($val, $rx)) { $codes.Add($m.Value) }
     }
-    # From message text
     $msg = $Event.Message
     if ($msg) {
         foreach ($m in [regex]::Matches($msg, $rx)) { $codes.Add($m.Value) }
     }
 
-    # Normalize: convert negative decimal HRESULTs to hex and annotate
     $normalized = foreach ($c in ($codes | Select-Object -Unique)) {
         if ($c -match '^-?\d+$') {
             try {
@@ -156,7 +171,6 @@ function Get-ErrorCodesFromEvent {
         }
     }
 
-    # Append hints inline when known
     $withHints = foreach ($n in $normalized) {
         $lookup = $n -replace '\s*\(dec.*\)$',''
         if ($errorCodeHints.ContainsKey($lookup)) {
@@ -174,24 +188,15 @@ function Get-SolutionKeyCandidates {
     param([System.Diagnostics.Eventing.Reader.EventRecord] $Event)
 
     $candidates = New-Object System.Collections.Generic.List[string]
-    # Channel-based
-    $candidates.Add("$($Event.LogName):$($Event.Id)")
-    # Source-based
-    $candidates.Add("$($Event.ProviderName):$($Event.Id)")
+    $candidates.Add("$($Event.LogName):$($Event.Id)")         # Channel-based
+    $candidates.Add("$($Event.ProviderName):$($Event.Id)")    # Source-based
 
-    # Heuristic: for Windows Update Client, also try its Operational channel mapping
     if ($Event.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient") {
         $candidates.Add("Microsoft-Windows-WindowsUpdateClient/Operational:$($Event.Id)")
     }
 
-    # Return unique in insertion order
     return ($candidates | Select-Object -Unique)
 }
-
-# --- Header ---
-"Event Log Analysis Report" | Out-File -FilePath $logPath -Append -Encoding utf8
-"Run on: $(Get-Date)"       | Out-File -FilePath $logPath -Append -Encoding utf8
-"------------------------"  | Out-File -FilePath $logPath -Append -Encoding utf8
 
 $logs = @(
     "System",
@@ -209,10 +214,9 @@ foreach ($log in $logs) {
     $filter = @{
         LogName   = $log
         StartTime = (Get-Date).AddHours(-240) # Last 10 days
-        Level     = 2,3     # 2=Error, 3=Warning
+        Level     = 2,3                      # 2=Error, 3=Warning
     }
 
-    # Force array to avoid single-object pitfalls
     $events = @(Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue)
 
     if ($events.Count -gt 0) {
@@ -220,7 +224,6 @@ foreach ($log in $logs) {
         "Issues found in $log log:" | Out-File -FilePath $logPath -Append -Encoding utf8
 
         foreach ($event in $events) {
-            # Try multiple keys for solution lookup
             $solution = $null
             foreach ($candidateKey in (Get-SolutionKeyCandidates -Event $event)) {
                 if ($solutions.ContainsKey($candidateKey)) {
@@ -232,7 +235,6 @@ foreach ($log in $logs) {
                 $solution = "No specific solution available. Investigate the error message further or search for the Event ID online."
             }
 
-            # Extract codes for WU events even if they appear in System
             $shouldExtractCodes =
                 ($event.LogName -eq "Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin") -or
                 ($event.LogName -eq "Microsoft-Windows-WindowsUpdateClient/Operational") -or
@@ -268,5 +270,5 @@ if (-not $hasIssues) {
     "No issues found in the last 24 hours." | Out-File -FilePath $logPath -Append -Encoding utf8
 }
 
-"End of Report" | Out-File -FilePath $logPath -Append -Encoding utf8
+"End of Report"        | Out-File -FilePath $logPath -Append -Encoding utf8
 "=========================" | Out-File -FilePath $logPath -Append -Encoding utf8
